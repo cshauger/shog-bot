@@ -8,6 +8,15 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Debug: print what we got
+logger.info(f"TELEGRAM_TOKEN set: {bool(TELEGRAM_TOKEN)}")
+logger.info(f"GROQ_API_KEY set: {bool(GROQ_API_KEY)}")
+
+if not GROQ_API_KEY:
+    raise ValueError(f"GROQ_API_KEY not set. Env vars: {list(os.environ.keys())}")
+
 groq_client = Groq(api_key=GROQ_API_KEY)
 history = []
 
@@ -38,6 +47,9 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("🤖 Shog starting...")
     app.run_polling()
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
