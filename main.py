@@ -1,10 +1,10 @@
 """
 Multi-Bot Runner - Runs multiple Telegram bots from database
+VERSION: 2026-02-16-debug
 """
 import os
 import asyncio
 import logging
-import json
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from telegram import Update
@@ -14,12 +14,18 @@ from groq import Groq
 DATABASE_URL = os.environ.get("DATABASE_URL")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Debug: Print database URL (masked)
+if DATABASE_URL:
+    masked = DATABASE_URL[:30] + "..." + DATABASE_URL[-20:] if len(DATABASE_URL) > 50 else DATABASE_URL
+    logger.info(f"DATABASE_URL: {masked}")
+else:
+    logger.error("DATABASE_URL not set!")
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Store conversation history per user per bot
 conversations = {}
 
 def get_db():
@@ -49,8 +55,30 @@ def get_active_bots():
     """Get all active bots from database"""
     with get_db() as conn:
         with conn.cursor() as cur:
+            # Debug: Check table exists and columns
+            cur.execute("""
+                SELECT column_name FROM information_schema.columns 
+                WHERE table_name = 'bots' ORDER BY ordinal_position
+            """)
+            columns = [row['column_name'] for row in cur.fetchall()]
+            logger.info(f"📋 Table 'bots' columns: {columns}")
+            
+            # Debug: Check total count
+            cur.execute("SELECT COUNT(*) as count FROM bots")
+            total = cur.fetchone()['count']
+            logger.info(f"📊 Total rows in bots table: {total}")
+            
+            # Debug: Check is_active values
+            cur.execute("SELECT id, is_active, bot_token IS NOT NULL as has_token FROM bots")
+            for row in cur.fetchall():
+                logger.info(f"   Row {row['id']}: is_active={row['is_active']} (type: {type(row['is_active']).__name__}), has_token={row['has_token']}")
+            
+            # Now get active bots
             cur.execute("SELECT * FROM bots WHERE is_active = true")
-            return cur.fetchall()
+            bots = cur.fetchall()
+            logger.info(f"🤖 Active bots query returned: {len(bots)} bots")
+            
+            return bots
 
 def get_history_key(bot_id, user_id):
     return f"{bot_id}:{user_id}"
@@ -96,9 +124,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def run_bot(bot_config):
     """Run a single bot"""
+    logger.info(f"🔧 Attempting to start bot with config: {dict(bot_config)}")
+    
     token = bot_config['bot_token']
     bot_id = bot_config['id']
     personality = bot_config.get('personality') or "You are a helpful personal assistant. Be friendly and concise."
+    
+    if not token:
+        logger.error(f"Bot {bot_id} has no token!")
+        return None
     
     app = Application.builder().token(token).build()
     app.bot_data['bot_id'] = bot_id
@@ -117,34 +151,40 @@ async def run_bot(bot_config):
     return app
 
 async def main():
-    logger.info("🚀 Multi-Bot Runner starting...")
-    ensure_tables()
+    logger.info("🚀 Multi-Bot Runner starting... (DEBUG VERSION)")
+    
+    try:
+        ensure_tables()
+    except Exception as e:
+        logger.error(f"Failed to ensure tables: {e}")
+        raise
     
     bots = get_active_bots()
     logger.info(f"Found {len(bots)} active bots")
     
     if not bots:
-        logger.warning("No active bots found. Waiting...")
+        logger.warning("No active bots found. Will poll every 30s...")
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(30)
+            logger.info("Polling for bots...")
             bots = get_active_bots()
             if bots:
+                logger.info(f"Found {len(bots)} bots, starting them...")
                 break
     
     apps = []
     for bot in bots:
         try:
             app = await run_bot(bot)
-            apps.append(app)
+            if app:
+                apps.append(app)
         except Exception as e:
-            logger.error(f"Failed to start bot {bot['id']}: {e}")
+            logger.error(f"Failed to start bot {bot.get('id', '?')}: {e}")
     
     logger.info(f"✅ Running {len(apps)} bots")
     
-    # Keep running
     while True:
         await asyncio.sleep(60)
 
 if __name__ == "__main__":
     asyncio.run(main())
-    main()
