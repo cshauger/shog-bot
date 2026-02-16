@@ -25,6 +25,26 @@ conversations = {}
 def get_db():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
+def ensure_tables():
+    """Create tables if they don't exist"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bots (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER,
+                    bot_token TEXT NOT NULL,
+                    bot_username VARCHAR(255),
+                    bot_name VARCHAR(255),
+                    model VARCHAR(50) DEFAULT 'llama-3.3-70b',
+                    personality TEXT,
+                    is_active BOOLEAN DEFAULT true,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            conn.commit()
+            logger.info("✅ Tables ready")
+
 def get_active_bots():
     """Get all active bots from database"""
     with get_db() as conn:
@@ -98,6 +118,7 @@ async def run_bot(bot_config):
 
 async def main():
     logger.info("🚀 Multi-Bot Runner starting...")
+    ensure_tables()
     
     bots = get_active_bots()
     logger.info(f"Found {len(bots)} active bots")
