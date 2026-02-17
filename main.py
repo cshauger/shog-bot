@@ -21,8 +21,8 @@ def get_db():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 
-def ensure_tables():
-    logger.info("NUKING bots table and recreating...")
+def setup_database():
+    logger.info("Setting up database...")
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS bots CASCADE")
@@ -38,8 +38,13 @@ def ensure_tables():
                 "is_active BOOLEAN DEFAULT true, "
                 "created_at TIMESTAMP DEFAULT NOW())"
             )
+            # INSERT TEST BOT DIRECTLY
+            cur.execute(
+                "INSERT INTO bots (user_id, bot_token, bot_username, bot_name) VALUES (%s, %s, %s, %s)",
+                (8259734518, "8154043410:AAGMwqlcLQGi6-6exAD5TFDDZaL1oNSajrE", "Shog99Bot", "Shog")
+            )
             conn.commit()
-    logger.info("Fresh bots table created!")
+    logger.info("Database ready with test bot!")
 
 
 def get_active_bots():
@@ -112,14 +117,9 @@ async def run_bot(bot_config):
 async def main():
     logger.info("Multi-bot runner starting...")
     
-    ensure_tables()
+    setup_database()
     
-    while True:
-        bots = get_active_bots()
-        if bots:
-            break
-        logger.info("No bots yet. Waiting 30s...")
-        await asyncio.sleep(30)
+    bots = get_active_bots()
     
     apps = []
     for bot in bots:
