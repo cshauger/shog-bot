@@ -41,7 +41,7 @@ def setup_database():
             # INSERT TEST BOT DIRECTLY
             cur.execute(
                 "INSERT INTO bots (user_id, bot_token, bot_username, bot_name) VALUES (%s, %s, %s, %s)",
-                (8259734518, "8154043410:AAGMwqlcLQGi6-6exAD5TFDDZaL1oNSajrE", "Shog99Bot", "Shog")
+                (8259734518, "8548378367:AAGmB0-0NwvHCUDz3YvogwlBus330_fGMgs", "Shog99Bot", "Shog")
             )
             conn.commit()
     logger.info("Database ready with test bot!")
