@@ -1,4 +1,4 @@
--e python-telegram-bot
+python-telegram-bot
 psycopg2-binary
 groq
 requests
