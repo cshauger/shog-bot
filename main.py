@@ -1,21 +1,24 @@
 import os
 import asyncio
 import logging
+import base64
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from groq import Groq
+import requests
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://email-webhook-production-887d.up.railway.app")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 conversations = {}
-notified_emails = set()  # Track notified emails in memory (backup)
+notified_emails = set()
 
 
 def get_db():
@@ -51,7 +54,6 @@ def setup_database():
                 "read BOOLEAN DEFAULT FALSE, "
                 "notified BOOLEAN DEFAULT FALSE)"
             )
-            # Add notified column if missing (migration)
             cur.execute("""
                 DO $$ 
                 BEGIN 
@@ -70,8 +72,17 @@ def setup_database():
                 "file_type TEXT, "
                 "file_size INTEGER, "
                 "caption TEXT, "
+                "drive_link TEXT, "
                 "uploaded_at TIMESTAMP DEFAULT NOW())"
             )
+            # Add drive_link column if missing
+            cur.execute("""
+                DO $$ 
+                BEGIN 
+                    ALTER TABLE files ADD COLUMN drive_link TEXT;
+                EXCEPTION WHEN duplicate_column THEN NULL;
+                END $$;
+            """)
             conn.commit()
     logger.info("Database ready!")
 
@@ -104,7 +115,6 @@ def get_emails_for_bot(bot_id, limit=5, unread_only=False):
 
 
 def get_unnotified_emails(bot_id):
-    """Get emails that haven't been notified yet"""
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -115,7 +125,6 @@ def get_unnotified_emails(bot_id):
 
 
 def mark_email_notified(email_id):
-    """Mark email as notified in database"""
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE emails SET notified = TRUE WHERE id = %s", (email_id,))
@@ -138,13 +147,13 @@ def get_email_by_id(email_id, bot_id):
 
 # ============== FILE FUNCTIONS ==============
 
-def store_file(bot_id, user_id, file_id, file_unique_id, file_name, file_type, file_size, caption):
+def store_file(bot_id, user_id, file_id, file_unique_id, file_name, file_type, file_size, caption, drive_link=None):
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO files (bot_id, user_id, file_id, file_unique_id, file_name, file_type, file_size, caption)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
-                (bot_id, user_id, file_id, file_unique_id, file_name, file_type, file_size, caption)
+                """INSERT INTO files (bot_id, user_id, file_id, file_unique_id, file_name, file_type, file_size, caption, drive_link)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                (bot_id, user_id, file_id, file_unique_id, file_name, file_type, file_size, caption, drive_link)
             )
             file_db_id = cur.fetchone()["id"]
             conn.commit()
@@ -180,20 +189,115 @@ def search_files(bot_id, query):
             return cur.fetchall()
 
 
+# ============== GOOGLE DRIVE FUNCTIONS ==============
+
+def check_drive_connected(bot_id, user_id):
+    """Check if user has connected Google Drive"""
+    try:
+        response = requests.get(
+            f"{WEBHOOK_URL}/oauth/status",
+            params={'bot_id': bot_id, 'user_id': user_id, 'provider': 'google'},
+            timeout=5
+        )
+        if response.status_code == 200:
+            return response.json().get('connected', False)
+    except Exception as e:
+        logger.error(f"Error checking Drive status: {e}")
+    return False
+
+
+def get_drive_auth_url(bot_id, user_id):
+    """Get Google OAuth URL"""
+    try:
+        response = requests.get(
+            f"{WEBHOOK_URL}/oauth/start",
+            params={'bot_id': bot_id, 'user_id': user_id, 'provider': 'google'},
+            timeout=5
+        )
+        if response.status_code == 200:
+            return response.json().get('auth_url')
+    except Exception as e:
+        logger.error(f"Error getting auth URL: {e}")
+    return None
+
+
+def upload_to_drive(bot_id, user_id, file_name, file_content, folder_name="CrabPass"):
+    """Upload file to user's Google Drive"""
+    try:
+        response = requests.post(
+            f"{WEBHOOK_URL}/drive/upload",
+            json={
+                'bot_id': bot_id,
+                'user_id': user_id,
+                'file_name': file_name,
+                'file_content': base64.b64encode(file_content).decode('utf-8'),
+                'folder_name': folder_name
+            },
+            timeout=30
+        )
+        if response.status_code == 200:
+            return response.json()
+    except Exception as e:
+        logger.error(f"Error uploading to Drive: {e}")
+    return None
+
+
 # ============== COMMAND HANDLERS ==============
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_username = context.bot_data.get("bot_username", "")
     name = context.bot.first_name
     email = bot_username.lower() + "@crabpass.ai" if bot_username else "your-bot@crabpass.ai"
+    
+    bot_id = context.bot_data.get("bot_id", 0)
+    user_id = update.effective_user.id
+    drive_connected = check_drive_connected(bot_id, user_id)
+    
+    drive_status = "✅ Connected" if drive_connected else "❌ Not connected (/connect to set up)"
+    
     await update.message.reply_text(
         f"Hey! I'm {name}. How can I help?\n\n"
         f"📧 Email: {email}\n"
-        f"📁 Send me files to store them\n\n"
+        f"📁 Google Drive: {drive_status}\n\n"
         f"Commands:\n"
+        f"/connect - Connect Google Drive\n"
         f"/emails - Check inbox\n"
         f"/files - List stored files\n"
         f"/find <query> - Search files"
+    )
+
+
+async def connect_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Connect Google Drive"""
+    bot_id = context.bot_data.get("bot_id", 0)
+    user_id = update.effective_user.id
+    
+    # Check if already connected
+    if check_drive_connected(bot_id, user_id):
+        await update.message.reply_text(
+            "✅ Google Drive is already connected!\n\n"
+            "Files you send me will be saved to your Drive."
+        )
+        return
+    
+    # Get auth URL
+    auth_url = get_drive_auth_url(bot_id, user_id)
+    
+    if not auth_url:
+        await update.message.reply_text(
+            "❌ Google Drive connection is not configured yet.\n\n"
+            "The bot admin needs to set up Google OAuth credentials."
+        )
+        return
+    
+    keyboard = [[InlineKeyboardButton("🔗 Connect Google Drive", url=auth_url)]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "📁 Connect your Google Drive\n\n"
+        "Click the button below to authorize access. "
+        "Files you send me will be saved to a 'CrabPass' folder in your Drive.",
+        reply_markup=reply_markup
     )
 
 
@@ -215,7 +319,6 @@ async def emails_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from_addr = email["from_email"][:30]
         lines.append(f"{status} #{email['id']}: {subject}\n   From: {from_addr}")
     
-    # Add inline buttons for each email
     keyboard = []
     for email in emails[:5]:
         subject = (email["subject"] or "(no subject)")[:20]
@@ -228,7 +331,6 @@ async def emails_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def read_email_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_id = context.bot_data.get("bot_id", 0)
     
-    # If no args, show most recent unread or list
     if not context.args:
         emails = get_emails_for_bot(bot_id, limit=1, unread_only=True)
         if emails:
@@ -254,11 +356,10 @@ async def read_email_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def show_email(message_or_query, email):
-    """Display an email (works for both messages and callback queries)"""
+    """Display an email"""
     mark_email_read(email["id"])
     
     body = email["body_plain"] or email["body_html"] or "(empty)"
-    # Strip HTML tags if we only have HTML
     if not email["body_plain"] and email["body_html"]:
         import re
         body = re.sub('<[^<]+?>', '', body)
@@ -332,9 +433,9 @@ async def files_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = f["file_name"] or f["caption"] or f["file_type"]
         size = f["file_size"] or 0
         size_str = f"{size // 1024}KB" if size > 0 else ""
-        lines.append(f"{icon} #{f['id']}: {name} {size_str}")
+        drive_icon = "☁️" if f.get("drive_link") else ""
+        lines.append(f"{icon} #{f['id']}: {name} {size_str} {drive_icon}")
         
-        # Add button for each file
         short_name = (name[:15] + "...") if len(name) > 18 else name
         keyboard.append([InlineKeyboardButton(f"{icon} Get #{f['id']}: {short_name}", callback_data=f"get_{f['id']}")])
     
@@ -365,6 +466,11 @@ async def retrieve_file(message, context, file_db_id):
         await message.reply_text("File not found")
         return
     
+    # If has Drive link, show that too
+    drive_link = file_record.get("drive_link")
+    if drive_link:
+        await message.reply_text(f"☁️ Google Drive: {drive_link}")
+    
     try:
         file_id = file_record["file_id"]
         file_type = file_record["file_type"]
@@ -385,7 +491,10 @@ async def retrieve_file(message, context, file_db_id):
             
     except Exception as e:
         logger.error(f"Error retrieving file: {e}")
-        await message.reply_text("Error retrieving file. It may have expired.")
+        if drive_link:
+            await message.reply_text(f"Telegram file expired, but here's the Drive link:\n{drive_link}")
+        else:
+            await message.reply_text("Error retrieving file. It may have expired.")
 
 
 async def find_files_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -418,11 +527,12 @@ async def find_files_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ============== FILE HANDLER ==============
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle incoming files, photos, documents, etc."""
+    """Handle incoming files - save to Telegram and optionally Google Drive"""
     bot_id = context.bot_data.get("bot_id", 0)
     user_id = update.effective_user.id
     message = update.message
     
+    file_obj = None
     file_id = None
     file_unique_id = None
     file_name = None
@@ -431,6 +541,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = message.caption or ""
     
     if message.document:
+        file_obj = message.document
         file_id = message.document.file_id
         file_unique_id = message.document.file_unique_id
         file_name = message.document.file_name
@@ -438,30 +549,35 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_size = message.document.file_size
     elif message.photo:
         photo = message.photo[-1]
+        file_obj = photo
         file_id = photo.file_id
         file_unique_id = photo.file_unique_id
         file_name = "photo.jpg"
         file_type = "photo"
         file_size = photo.file_size
     elif message.video:
+        file_obj = message.video
         file_id = message.video.file_id
         file_unique_id = message.video.file_unique_id
         file_name = message.video.file_name or "video.mp4"
         file_type = "video"
         file_size = message.video.file_size
     elif message.audio:
+        file_obj = message.audio
         file_id = message.audio.file_id
         file_unique_id = message.audio.file_unique_id
         file_name = message.audio.file_name or message.audio.title or "audio"
         file_type = "audio"
         file_size = message.audio.file_size
     elif message.voice:
+        file_obj = message.voice
         file_id = message.voice.file_id
         file_unique_id = message.voice.file_unique_id
         file_name = "voice.ogg"
         file_type = "voice"
         file_size = message.voice.file_size
     elif message.video_note:
+        file_obj = message.video_note
         file_id = message.video_note.file_id
         file_unique_id = message.video_note.file_unique_id
         file_name = "video_note.mp4"
@@ -469,17 +585,41 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_size = message.video_note.file_size
     
     if file_id:
-        file_db_id = store_file(bot_id, user_id, file_id, file_unique_id, file_name, file_type, file_size, caption)
+        await message.reply_text("📤 Processing file...")
+        
+        drive_link = None
+        
+        # Check if Google Drive is connected
+        if check_drive_connected(bot_id, user_id):
+            try:
+                # Download file from Telegram
+                tg_file = await context.bot.get_file(file_id)
+                file_bytes = await tg_file.download_as_bytearray()
+                
+                # Upload to Google Drive
+                result = upload_to_drive(bot_id, user_id, file_name, bytes(file_bytes))
+                if result and result.get('status') == 'ok':
+                    drive_link = result.get('web_link')
+            except Exception as e:
+                logger.error(f"Drive upload failed: {e}")
+        
+        file_db_id = store_file(bot_id, user_id, file_id, file_unique_id, file_name, file_type, file_size, caption, drive_link)
+        
+        # Build response
+        response_lines = [
+            f"✅ File saved!",
+            f"",
+            f"📄 {file_name}",
+            f"🆔 ID: #{file_db_id}"
+        ]
+        
+        if drive_link:
+            response_lines.append(f"☁️ Drive: {drive_link}")
         
         keyboard = [[InlineKeyboardButton(f"📥 Get this file", callback_data=f"get_{file_db_id}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await update.message.reply_text(
-            f"✅ File saved!\n\n"
-            f"📄 {file_name}\n"
-            f"🆔 ID: #{file_db_id}",
-            reply_markup=reply_markup
-        )
+        await message.reply_text("\n".join(response_lines), reply_markup=reply_markup)
 
 
 # ============== MESSAGE HANDLER ==============
@@ -505,6 +645,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if email_addr:
         system_prompt += f"\n\nYou have an email address: {email_addr}. Users can email you there."
     system_prompt += "\n\nUsers can send you files to store. Use /files to list, /get <id> to retrieve."
+    system_prompt += "\n\nUsers can connect their Google Drive with /connect for permanent file storage."
     
     await update.message.chat.send_action("typing")
     
@@ -530,7 +671,6 @@ async def check_new_emails(app, bot_id, user_id):
     emails = get_unnotified_emails(bot_id)
     
     for email in emails:
-        # Double-check we haven't notified (in case of race)
         email_key = f"{bot_id}:{email['id']}"
         if email_key in notified_emails:
             continue
@@ -577,24 +717,21 @@ async def run_bot(bot_config):
     app.bot_data["personality"] = personality
     app.bot_data["user_id"] = user_id
     
-    # Command handlers
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("connect", connect_command))
     app.add_handler(CommandHandler("emails", emails_command))
     app.add_handler(CommandHandler("read", read_email_command))
     app.add_handler(CommandHandler("files", files_command))
     app.add_handler(CommandHandler("get", get_file_command))
     app.add_handler(CommandHandler("find", find_files_command))
     
-    # Callback handler for inline buttons
     app.add_handler(CallbackQueryHandler(callback_handler))
     
-    # File handler
     app.add_handler(MessageHandler(
         filters.PHOTO | filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE,
         handle_file
     ))
     
-    # Text message handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     bot_info = await app.bot.get_me()
@@ -604,7 +741,6 @@ async def run_bot(bot_config):
     await app.start()
     await app.updater.start_polling()
     
-    # Start email checker
     asyncio.create_task(email_checker_loop(app, bot_id, user_id))
     
     return app
