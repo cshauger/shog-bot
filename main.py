@@ -3,8 +3,8 @@ import asyncio
 import logging
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from groq import Groq
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 conversations = {}
-last_email_check = {}
+notified_emails = set()  # Track notified emails in memory (backup)
 
 
 def get_db():
@@ -48,8 +48,17 @@ def setup_database():
                 "body_plain TEXT, "
                 "body_html TEXT, "
                 "received_at TIMESTAMP DEFAULT NOW(), "
-                "read BOOLEAN DEFAULT FALSE)"
+                "read BOOLEAN DEFAULT FALSE, "
+                "notified BOOLEAN DEFAULT FALSE)"
             )
+            # Add notified column if missing (migration)
+            cur.execute("""
+                DO $$ 
+                BEGIN 
+                    ALTER TABLE emails ADD COLUMN notified BOOLEAN DEFAULT FALSE;
+                EXCEPTION WHEN duplicate_column THEN NULL;
+                END $$;
+            """)
             cur.execute(
                 "CREATE TABLE IF NOT EXISTS files ("
                 "id SERIAL PRIMARY KEY, "
@@ -92,6 +101,25 @@ def get_emails_for_bot(bot_id, limit=5, unread_only=False):
                     (bot_id, limit)
                 )
             return cur.fetchall()
+
+
+def get_unnotified_emails(bot_id):
+    """Get emails that haven't been notified yet"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM emails WHERE bot_id = %s AND notified = FALSE ORDER BY received_at ASC",
+                (bot_id,)
+            )
+            return cur.fetchall()
+
+
+def mark_email_notified(email_id):
+    """Mark email as notified in database"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE emails SET notified = TRUE WHERE id = %s", (email_id,))
+            conn.commit()
 
 
 def mark_email_read(email_id):
@@ -164,9 +192,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📁 Send me files to store them\n\n"
         f"Commands:\n"
         f"/emails - Check inbox\n"
-        f"/read <id> - Read email\n"
         f"/files - List stored files\n"
-        f"/get <id> - Retrieve a file\n"
         f"/find <query> - Search files"
     )
 
@@ -189,21 +215,34 @@ async def emails_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from_addr = email["from_email"][:30]
         lines.append(f"{status} #{email['id']}: {subject}\n   From: {from_addr}")
     
-    lines.append(f"\nUse /read <id> to read an email")
-    await update.message.reply_text("\n".join(lines))
+    # Add inline buttons for each email
+    keyboard = []
+    for email in emails[:5]:
+        subject = (email["subject"] or "(no subject)")[:20]
+        keyboard.append([InlineKeyboardButton(f"📖 Read #{email['id']}: {subject}", callback_data=f"read_{email['id']}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("\n".join(lines), reply_markup=reply_markup)
 
 
 async def read_email_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_id = context.bot_data.get("bot_id", 0)
     
+    # If no args, show most recent unread or list
     if not context.args:
-        await update.message.reply_text("Usage: /read <email_id>")
-        return
+        emails = get_emails_for_bot(bot_id, limit=1, unread_only=True)
+        if emails:
+            email = emails[0]
+            await show_email(update.message, email)
+            return
+        else:
+            await update.message.reply_text("No unread emails. Use /emails to see all.")
+            return
     
     try:
         email_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("Invalid email ID")
+        await update.message.reply_text("Invalid email ID. Use /emails to see your inbox.")
         return
     
     email = get_email_by_id(email_id, bot_id)
@@ -211,9 +250,19 @@ async def read_email_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Email not found")
         return
     
-    mark_email_read(email_id)
+    await show_email(update.message, email)
+
+
+async def show_email(message_or_query, email):
+    """Display an email (works for both messages and callback queries)"""
+    mark_email_read(email["id"])
     
     body = email["body_plain"] or email["body_html"] or "(empty)"
+    # Strip HTML tags if we only have HTML
+    if not email["body_plain"] and email["body_html"]:
+        import re
+        body = re.sub('<[^<]+?>', '', body)
+    
     if len(body) > 2000:
         body = body[:2000] + "...(truncated)"
     
@@ -224,7 +273,38 @@ async def read_email_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"Date: {email['received_at']}\n\n"
         f"{body}"
     )
-    await update.message.reply_text(msg)
+    
+    if hasattr(message_or_query, 'reply_text'):
+        await message_or_query.reply_text(msg)
+    else:
+        await message_or_query.edit_message_text(msg)
+
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline button callbacks"""
+    query = update.callback_query
+    await query.answer()
+    
+    bot_id = context.bot_data.get("bot_id", 0)
+    data = query.data
+    
+    if data.startswith("read_"):
+        try:
+            email_id = int(data.split("_")[1])
+            email = get_email_by_id(email_id, bot_id)
+            if email:
+                await show_email(query, email)
+            else:
+                await query.edit_message_text("Email not found")
+        except (ValueError, IndexError):
+            await query.edit_message_text("Invalid email")
+    
+    elif data.startswith("get_"):
+        try:
+            file_id = int(data.split("_")[1])
+            await retrieve_file(query.message, context, file_id)
+        except (ValueError, IndexError):
+            await query.edit_message_text("Invalid file")
 
 
 async def files_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -236,6 +316,8 @@ async def files_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     lines = ["📁 Your files:\n"]
+    keyboard = []
+    
     for f in files:
         icon = "📄"
         if f["file_type"] == "photo":
@@ -251,16 +333,18 @@ async def files_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         size = f["file_size"] or 0
         size_str = f"{size // 1024}KB" if size > 0 else ""
         lines.append(f"{icon} #{f['id']}: {name} {size_str}")
+        
+        # Add button for each file
+        short_name = (name[:15] + "...") if len(name) > 18 else name
+        keyboard.append([InlineKeyboardButton(f"{icon} Get #{f['id']}: {short_name}", callback_data=f"get_{f['id']}")])
     
-    lines.append(f"\nUse /get <id> to retrieve a file")
-    await update.message.reply_text("\n".join(lines))
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("\n".join(lines), reply_markup=reply_markup)
 
 
 async def get_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot_id = context.bot_data.get("bot_id", 0)
-    
     if not context.args:
-        await update.message.reply_text("Usage: /get <file_id>")
+        await update.message.reply_text("Usage: /get <file_id>\n\nOr use /files to see buttons.")
         return
     
     try:
@@ -269,9 +353,16 @@ async def get_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid file ID")
         return
     
+    await retrieve_file(update.message, context, file_db_id)
+
+
+async def retrieve_file(message, context, file_db_id):
+    """Retrieve and send a file"""
+    bot_id = context.bot_data.get("bot_id", 0)
     file_record = get_file_by_id(file_db_id, bot_id)
+    
     if not file_record:
-        await update.message.reply_text("File not found")
+        await message.reply_text("File not found")
         return
     
     try:
@@ -280,21 +371,21 @@ async def get_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption = file_record["caption"] or ""
         
         if file_type == "photo":
-            await update.message.reply_photo(file_id, caption=caption)
+            await message.reply_photo(file_id, caption=caption)
         elif file_type == "video":
-            await update.message.reply_video(file_id, caption=caption)
+            await message.reply_video(file_id, caption=caption)
         elif file_type == "audio":
-            await update.message.reply_audio(file_id, caption=caption)
+            await message.reply_audio(file_id, caption=caption)
         elif file_type == "voice":
-            await update.message.reply_voice(file_id, caption=caption)
+            await message.reply_voice(file_id, caption=caption)
         elif file_type == "video_note":
-            await update.message.reply_video_note(file_id)
+            await message.reply_video_note(file_id)
         else:
-            await update.message.reply_document(file_id, caption=caption)
+            await message.reply_document(file_id, caption=caption)
             
     except Exception as e:
         logger.error(f"Error retrieving file: {e}")
-        await update.message.reply_text("Error retrieving file. It may have expired.")
+        await message.reply_text("Error retrieving file. It may have expired.")
 
 
 async def find_files_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -312,12 +403,16 @@ async def find_files_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     
     lines = [f"🔍 Files matching '{query}':\n"]
+    keyboard = []
+    
     for f in files:
         name = f["file_name"] or f["caption"] or f["file_type"]
         lines.append(f"📄 #{f['id']}: {name}")
+        short_name = (name[:15] + "...") if len(name) > 18 else name
+        keyboard.append([InlineKeyboardButton(f"📄 Get #{f['id']}: {short_name}", callback_data=f"get_{f['id']}")])
     
-    lines.append(f"\nUse /get <id> to retrieve")
-    await update.message.reply_text("\n".join(lines))
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("\n".join(lines), reply_markup=reply_markup)
 
 
 # ============== FILE HANDLER ==============
@@ -342,7 +437,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_type = "document"
         file_size = message.document.file_size
     elif message.photo:
-        # Get largest photo
         photo = message.photo[-1]
         file_id = photo.file_id
         file_unique_id = photo.file_unique_id
@@ -376,12 +470,15 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if file_id:
         file_db_id = store_file(bot_id, user_id, file_id, file_unique_id, file_name, file_type, file_size, caption)
+        
+        keyboard = [[InlineKeyboardButton(f"📥 Get this file", callback_data=f"get_{file_db_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
         await update.message.reply_text(
             f"✅ File saved!\n\n"
             f"📄 {file_name}\n"
-            f"🆔 ID: #{file_db_id}\n\n"
-            f"Use /files to see all files\n"
-            f"Use /get {file_db_id} to retrieve"
+            f"🆔 ID: #{file_db_id}",
+            reply_markup=reply_markup
         )
 
 
@@ -430,22 +527,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check_new_emails(app, bot_id, user_id):
     """Check for new emails and notify user"""
-    global last_email_check
+    emails = get_unnotified_emails(bot_id)
     
-    emails = get_emails_for_bot(bot_id, limit=1, unread_only=True)
-    if emails:
-        email = emails[0]
+    for email in emails:
+        # Double-check we haven't notified (in case of race)
         email_key = f"{bot_id}:{email['id']}"
+        if email_key in notified_emails:
+            continue
         
-        if email_key not in last_email_check:
-            last_email_check[email_key] = True
-            try:
-                await app.bot.send_message(
-                    chat_id=user_id,
-                    text=f"📬 New email!\n\nFrom: {email['from_email']}\nSubject: {email['subject'] or '(no subject)'}\n\nUse /read {email['id']} to read it."
-                )
-            except Exception as e:
-                logger.error(f"Failed to notify user: {e}")
+        notified_emails.add(email_key)
+        mark_email_notified(email['id'])
+        
+        try:
+            subject = email['subject'] or '(no subject)'
+            keyboard = [[InlineKeyboardButton("📖 Read this email", callback_data=f"read_{email['id']}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await app.bot.send_message(
+                chat_id=user_id,
+                text=f"📬 New email!\n\nFrom: {email['from_email']}\nSubject: {subject}",
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify user: {e}")
 
 
 async def email_checker_loop(app, bot_id, user_id):
@@ -481,7 +585,10 @@ async def run_bot(bot_config):
     app.add_handler(CommandHandler("get", get_file_command))
     app.add_handler(CommandHandler("find", find_files_command))
     
-    # File handler (photos, documents, videos, audio, voice)
+    # Callback handler for inline buttons
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    
+    # File handler
     app.add_handler(MessageHandler(
         filters.PHOTO | filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE,
         handle_file
