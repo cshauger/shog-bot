@@ -1,7 +1,7 @@
 """
 Multi-Bot Runner - Runs multiple Telegram bots from database
-VERSION: 2026-02-17-dynamic
-Features: Vision extraction, email, DYNAMIC bot loading
+VERSION: 2026-02-17-taxprompt
+Features: Vision extraction, email, dynamic loading, TAX PROMPTS
 """
 import os
 import asyncio
@@ -10,6 +10,7 @@ import psycopg2
 import base64
 import json
 import httpx
+import re
 from psycopg2.extras import RealDictCursor
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 conversations = {}
-running_bots = {}  # Track running bot IDs -> app
+running_bots = {}
 
 def get_db():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
@@ -34,33 +35,15 @@ def get_db():
 def ensure_tables():
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS bots (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    bot_token TEXT NOT NULL UNIQUE,
-                    bot_username TEXT,
-                    bot_name TEXT,
-                    model TEXT DEFAULT 'llama',
-                    personality TEXT,
-                    is_active BOOLEAN DEFAULT true,
-                    created_at TIMESTAMP DEFAULT NOW()
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS user_documents (
-                    id SERIAL PRIMARY KEY,
-                    bot_id INTEGER,
-                    user_id BIGINT NOT NULL,
-                    doc_type TEXT,
-                    extracted_data JSONB,
-                    file_id TEXT,
-                    file_name TEXT,
-                    created_at TIMESTAMP DEFAULT NOW()
-                )
-            """)
+            cur.execute("""CREATE TABLE IF NOT EXISTS bots (
+                id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL, bot_token TEXT NOT NULL UNIQUE,
+                bot_username TEXT, bot_name TEXT, model TEXT DEFAULT 'llama',
+                personality TEXT, is_active BOOLEAN DEFAULT true, created_at TIMESTAMP DEFAULT NOW())""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS user_documents (
+                id SERIAL PRIMARY KEY, bot_id INTEGER, user_id BIGINT NOT NULL,
+                doc_type TEXT, extracted_data JSONB, file_id TEXT, file_name TEXT,
+                created_at TIMESTAMP DEFAULT NOW())""")
             conn.commit()
-            logger.info("Tables ready")
 
 def get_active_bots():
     with get_db() as conn:
@@ -114,22 +97,18 @@ Return valid JSON only."""
                 ]}], "max_tokens": 1024}, timeout=30.0)
             result_text = resp.json()["choices"][0]["message"]["content"]
     try:
-        if "```json" in result_text:
-            result_text = result_text.split("```json")[1].split("```")[0]
-        elif "```" in result_text:
-            result_text = result_text.split("```")[1].split("```")[0]
+        if "```json" in result_text: result_text = result_text.split("```json")[1].split("```")[0]
+        elif "```" in result_text: result_text = result_text.split("```")[1].split("```")[0]
         return json.loads(result_text.strip())
     except:
         return {"doc_type": "unknown", "summary": result_text[:200]}
 
-async def send_email_with_attachments(to_email, subject, body, attachments=None):
+async def send_email_with_attachments(to_email, subject, body):
     email_data = {
         "personalizations": [{"to": [{"email": to_email}]}],
         "from": {"email": "assistant@crabpass.ai", "name": "Tax Assistant"},
         "subject": subject, "content": [{"type": "text/plain", "value": body}]
     }
-    if attachments:
-        email_data["attachments"] = attachments
     async with httpx.AsyncClient() as client:
         resp = await client.post("https://api.sendgrid.com/v3/mail/send",
             headers={"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"},
@@ -137,8 +116,7 @@ async def send_email_with_attachments(to_email, subject, body, attachments=None)
         return resp.status_code in [200, 202]
 
 def generate_tax_summary(documents):
-    if not documents:
-        return "No documents collected yet."
+    if not documents: return "No documents collected yet."
     summary = "TAX DOCUMENT SUMMARY\n" + "="*40 + "\n\n"
     totals = {"wages": 0, "federal_withheld": 0, "state_withheld": 0, "interest_income": 0, "dividend_income": 0}
     for doc in documents:
@@ -149,30 +127,54 @@ def generate_tax_summary(documents):
         doc_type = data.get('doc_type', 'Unknown')
         payer = data.get('payer_name', 'Unknown')
         summary += f"{doc_type} - {payer}\n"
-        amounts = data.get('amounts', {})
-        for key, val in amounts.items():
+        for key, val in data.get('amounts', {}).items():
             if val and isinstance(val, (int, float)) and val > 0:
                 summary += f"   {key.replace('_', ' ').title()}: ${val:,.2f}\n"
                 if key in totals: totals[key] += val
         summary += "\n"
     summary += "="*40 + "\nTOTALS:\n"
     for key, val in totals.items():
-        if val > 0:
-            summary += f"   {key.replace('_', ' ').title()}: ${val:,.2f}\n"
+        if val > 0: summary += f"   {key.replace('_', ' ').title()}: ${val:,.2f}\n"
     return summary
+
+def is_tax_help_request(text):
+    """Detect if user is asking for tax help"""
+    tax_keywords = ['tax', 'taxes', 'w-2', 'w2', '1099', 'refund', 'irs', 'deduction', 
+                    'accountant', 'cpa', 'filing', 'return', '1098', 'income tax']
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in tax_keywords)
+
+TAX_HELP_PROMPT = """📋 **Tax Document Assistant**
+
+I can help you organize your tax documents! Here's what to do:
+
+1️⃣ **Send photos** of your tax forms:
+   • W-2 (from employers)
+   • 1099-INT (bank interest)
+   • 1099-DIV (dividends)
+   • 1099-NEC/MISC (freelance income)
+   • 1098 (mortgage interest)
+   • Receipts for deductions
+
+2️⃣ I'll **extract the key numbers** automatically
+
+3️⃣ Say "**show summary**" to see everything collected
+
+4️⃣ Say "**email summary to youraccountant@email.com**" to send it off
+
+Ready when you are! 📸"""
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_name = context.bot.first_name
     await update.message.reply_text(
         f"Hey! I'm {bot_name}.\n\n"
-        "Send photos of tax docs (W-2s, 1099s) and I'll extract the data.\n"
-        "Say 'email summary to [address]' to send to your accountant.\n"
-        "Say 'show summary' to see what I've collected.")
+        "I can help with taxes, answer questions, or just chat.\n"
+        "Send photos of tax docs and I'll extract the data for you!")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_id = context.bot_data.get('bot_id', 0)
     user_id = update.effective_user.id
-    await update.message.reply_text("Analyzing document...")
+    await update.message.reply_text("📸 Analyzing document...")
     await update.message.chat.send_action("typing")
     try:
         photo = update.message.photo[-1]
@@ -182,64 +184,72 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_document(bot_id, user_id, extracted.get('doc_type', 'unknown'), extracted, photo.file_id)
         doc_type = extracted.get('doc_type', 'Document')
         payer = extracted.get('payer_name', '')
-        response = f"**{doc_type}**"
+        response = f"📄 **{doc_type}**"
         if payer: response += f" from {payer}"
-        response += "\n"
-        amounts = extracted.get('amounts', {})
-        for key, val in amounts.items():
+        response += "\n\n"
+        for key, val in extracted.get('amounts', {}).items():
             if val and isinstance(val, (int, float)) and val > 0:
                 response += f"• {key.replace('_', ' ').title()}: ${val:,.2f}\n"
         docs = get_user_documents(bot_id, user_id)
-        response += f"\n{len(docs)} doc(s) collected."
+        response += f"\n✅ {len(docs)} document(s) collected.\nSend more or say 'show summary'"
         await update.message.reply_text(response, parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Photo error: {e}")
-        await update.message.reply_text("Had trouble with that image. Try again.")
+        await update.message.reply_text("Had trouble with that image. Try a clearer photo.")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_id = context.bot_data.get('bot_id', 0)
     user_id = update.effective_user.id
     doc = update.message.document
-    await update.message.reply_text(f"Got {doc.file_name}. Storing...")
+    await update.message.reply_text(f"📎 Got {doc.file_name}. Storing...")
     save_document(bot_id, user_id, "pdf", {"file_name": doc.file_name}, doc.file_id, doc.file_name)
     docs = get_user_documents(bot_id, user_id)
-    await update.message.reply_text(f"Saved! {len(docs)} doc(s) collected.")
+    await update.message.reply_text(f"✅ Saved! {len(docs)} document(s) collected.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_id = context.bot_data.get('bot_id', 0)
     user_id = update.effective_user.id
-    text = update.message.text.lower().strip()
+    text = update.message.text
+    text_lower = text.lower().strip()
     
-    if 'show summary' in text or 'tax summary' in text:
+    # Check for tax-related commands first
+    if 'show summary' in text_lower or 'tax summary' in text_lower:
         docs = get_user_documents(bot_id, user_id)
         summary = generate_tax_summary(docs)
         await update.message.reply_text(f"```\n{summary}\n```", parse_mode='Markdown')
         return
-    if 'email' in text and '@' in text:
-        import re
-        emails = re.findall(r'[\w\.-]+@[\w\.-]+\.\w+', text)
+    
+    if 'email' in text_lower and '@' in text_lower:
+        emails = re.findall(r'[\w\.-]+@[\w\.-]+\.\w+', text_lower)
         if emails:
             to_email = emails[0]
             docs = get_user_documents(bot_id, user_id)
             summary = generate_tax_summary(docs)
-            await update.message.reply_text(f"Sending to {to_email}...")
+            await update.message.reply_text(f"📧 Sending to {to_email}...")
             if await send_email_with_attachments(to_email, f"Tax Summary - {update.effective_user.first_name}", summary):
-                await update.message.reply_text(f"Sent to {to_email}!")
+                await update.message.reply_text(f"✅ Sent to {to_email}!")
             else:
-                await update.message.reply_text("Email failed.")
+                await update.message.reply_text("❌ Email failed. Try again.")
             return
-    if 'clear' in text and 'document' in text:
+    
+    if 'clear' in text_lower and 'document' in text_lower:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM user_documents WHERE bot_id = %s AND user_id = %s", (bot_id, user_id))
                 conn.commit()
-        await update.message.reply_text("Cleared!")
+        await update.message.reply_text("🗑️ Documents cleared!")
         return
     
+    # Check if asking for tax help - show the prompt
+    if is_tax_help_request(text):
+        await update.message.reply_text(TAX_HELP_PROMPT, parse_mode='Markdown')
+        return
+    
+    # Regular chat
     key = get_history_key(bot_id, user_id)
     if key not in conversations: conversations[key] = []
     history = conversations[key]
-    history.append({"role": "user", "content": update.message.text})
+    history.append({"role": "user", "content": text})
     history = history[-20:]
     conversations[key] = history
     personality = context.bot_data.get('personality', "You are a helpful assistant.")
@@ -254,7 +264,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply)
     except Exception as e:
         logger.error(f"Error: {e}")
-        await update.message.reply_text("Hit a snag.")
+        await update.message.reply_text("Hit a snag. Try again.")
 
 async def run_bot(bot_config):
     token = bot_config['bot_token']
@@ -276,46 +286,35 @@ async def run_bot(bot_config):
     return app
 
 async def check_for_new_bots():
-    """Check DB for new bots and start them dynamically"""
     global running_bots
     while True:
         await asyncio.sleep(30)
         try:
             bots = get_active_bots()
             for bot in bots:
-                bot_id = bot['id']
-                if bot_id not in running_bots:
-                    logger.info(f"New bot detected: ID {bot_id}, starting...")
+                if bot['id'] not in running_bots:
+                    logger.info(f"New bot detected: ID {bot['id']}")
                     try:
                         app = await run_bot(bot)
-                        if app:
-                            running_bots[bot_id] = app
-                            logger.info(f"New bot started: ID {bot_id}")
+                        if app: running_bots[bot['id']] = app
                     except Exception as e:
-                        logger.error(f"Failed to start new bot {bot_id}: {e}")
+                        logger.error(f"Failed new bot {bot['id']}: {e}")
         except Exception as e:
-            logger.error(f"Error checking for new bots: {e}")
+            logger.error(f"Error checking bots: {e}")
 
 async def main():
     global running_bots
-    logger.info("Multi-Bot Runner (DYNAMIC) starting...")
+    logger.info("Multi-Bot Runner (TAX PROMPTS) starting...")
     ensure_tables()
     bots = get_active_bots()
-    logger.info(f"Found {len(bots)} active bots")
-    
     for bot in bots:
         try:
             app = await run_bot(bot)
-            if app:
-                running_bots[bot['id']] = app
+            if app: running_bots[bot['id']] = app
         except Exception as e:
             logger.error(f"Failed bot {bot.get('id')}: {e}")
-    
-    logger.info(f"Running {len(running_bots)} bots, watching for new registrations...")
-    
-    # Start background task to check for new bots
+    logger.info(f"Running {len(running_bots)} bots")
     asyncio.create_task(check_for_new_bots())
-    
     while True:
         await asyncio.sleep(60)
 
