@@ -22,12 +22,11 @@ def get_db():
 
 
 def setup_database():
-    logger.info("Setting up database...")
+    logger.info("Ensuring bots table exists...")
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("DROP TABLE IF EXISTS bots CASCADE")
             cur.execute(
-                "CREATE TABLE bots ("
+                "CREATE TABLE IF NOT EXISTS bots ("
                 "id SERIAL PRIMARY KEY, "
                 "user_id BIGINT NOT NULL, "
                 "bot_token TEXT NOT NULL UNIQUE, "
@@ -38,13 +37,8 @@ def setup_database():
                 "is_active BOOLEAN DEFAULT true, "
                 "created_at TIMESTAMP DEFAULT NOW())"
             )
-            # INSERT TEST BOT DIRECTLY
-            cur.execute(
-                "INSERT INTO bots (user_id, bot_token, bot_username, bot_name) VALUES (%s, %s, %s, %s)",
-                (8259734518, "8548378367:AAGmB0-0NwvHCUDz3YvogwlBus330_fGMgs", "Shog99Bot", "Shog")
-            )
             conn.commit()
-    logger.info("Database ready with test bot!")
+    logger.info("Database ready!")
 
 
 def get_active_bots():
@@ -119,20 +113,23 @@ async def main():
     
     setup_database()
     
-    bots = get_active_bots()
-    
-    apps = []
-    for bot in bots:
-        try:
-            app = await run_bot(bot)
-            apps.append(app)
-        except Exception as e:
-            logger.error("Failed to start bot %s: %s", bot.get("id"), e)
-    
-    logger.info("Running %d bots", len(apps))
+    running_bots = {}
     
     while True:
-        await asyncio.sleep(60)
+        bots = get_active_bots()
+        
+        for bot in bots:
+            bot_id = bot["id"]
+            if bot_id not in running_bots:
+                try:
+                    app = await run_bot(bot)
+                    running_bots[bot_id] = app
+                    logger.info("Started bot ID %d", bot_id)
+                except Exception as e:
+                    logger.error("Failed to start bot %s: %s", bot_id, e)
+        
+        logger.info("Running %d bots, checking again in 30s", len(running_bots))
+        await asyncio.sleep(30)
 
 
 if __name__ == "__main__":
