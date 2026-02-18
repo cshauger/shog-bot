@@ -47,7 +47,7 @@ def ensure_tables():
 def get_active_bots():
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM bots WHERE is_active = true")
+            cur.execute("SELECT * FROM bots WHERE is_active = true AND (railway_service_id IS NULL OR railway_service_id = '')")
             return cur.fetchall()
 
 def save_document(bot_id, user_id, doc_type, extracted_data, file_id, file_name=None):
