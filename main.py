@@ -47,7 +47,7 @@ def ensure_tables():
 def get_active_bots():
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM bots WHERE is_active = true AND (railway_service_id IS NULL OR railway_service_id = '')")
+            cur.execute("SELECT * FROM bots WHERE is_active = true")
             return cur.fetchall()
 
 def save_document(bot_id, user_id, doc_type, extracted_data, file_id, file_name=None):
@@ -169,7 +169,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Hey! I'm {bot_name}, your private assistant.\n\n"
         f"📧 My email: **{bot_email}**\n"
         f"Forward emails here and I'll notify you!\n\n"
-        f"I can also help with taxes - just send photos of your docs.", parse_mode='Markdown')
+        f"Just chat with me about anything!", parse_mode='Markdown')
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_owner(update, context): return
